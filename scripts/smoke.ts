@@ -2033,12 +2033,104 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
 
 // 22a) CSV 解析：引号、转义双引号、字段内逗号/换行、CRLF、BOM、空行
 {
-  const recs = parseCsv('﻿网段 CIDR,设备名\r\n192.168.10.16/30,"设备,A"\r\n\r\n"x""y",z\n')
+  const { records: recs, error } = parseCsv('﻿网段 CIDR,设备名\r\n192.168.10.16/30,"设备,A"\r\n\r\n"x""y",z\n')
+  check('合法 CSV 无语法错误', error === null, JSON.stringify(error))
   check('CSV 解析：BOM 去除、CRLF、跳过空行（3 条记录）', recs.length === 3, JSON.stringify(recs))
   check('CSV 表头两列', recs[0].cells.length === 2 && recs[0].cells[0] === '网段 CIDR')
   check('CSV 引号内逗号不切分', recs[1].cells[1] === '设备,A')
   check('CSV 双引号转义', recs[2].cells[0] === 'x"y' && recs[2].line === 4, JSON.stringify(recs[2]))
-  check('空文本解析为空记录', parseCsv('  \n \n').length === 0)
+  check('空文本解析为空记录', parseCsv('  \n \n').records.length === 0)
+  // 引号内换行：CRLF / 单独 CR / 单独 LF 都保留原始换行字符，且 CRLF 只算一次物理行
+  const q = parseCsv('a,"x\r\ny"\r\nb')
+  check('引号内 CRLF 原样保留且只算一次换行', q.error === null && q.records.length === 2 &&
+    q.records[0].cells[1] === 'x\r\ny' && q.records[1].line === 3, JSON.stringify(q))
+  check('引号内单独 CR 原样保留', parseCsv('"p\rq"').records[0]?.cells[0] === 'p\rq')
+  check('引号内单独 LF 原样保留', parseCsv('"p\nq"').records[0]?.cells[0] === 'p\nq')
+  check('单独 CR 也算记录换行', parseCsv('a\rb').records.length === 2 && parseCsv('a\rb').records[1].line === 2)
+  check('空引号字段也算有内容（1 条记录、字段为空串）', (() => {
+    const r = parseCsv('""')
+    return r.records.length === 1 && r.records[0].cells.length === 1 && r.records[0].cells[0] === ''
+  })())
+  check('引号转义后闭引号合法（"a""b" -> a"b）', parseCsv('"a""b"').records[0]?.cells[0] === 'a"b' && parseCsv('"a""b"').error === null)
+}
+
+// 22a2) CSV 语法错误：未闭合引号 / 未加引号字段内的引号 / 闭引号后杂字符
+{
+  // 末条引号未闭合：该条丢弃、前文完整记录保留，并报语法错误（定位开引号）
+  const unclosed = parseCsv('网段 CIDR,设备名\n192.168.10.16/30,设备A\n192.168.10.16/30,"设备B')
+  check('未闭合引号：报错且完整前文保留（2 条记录）', unclosed.records.length === 2 && unclosed.error !== null, JSON.stringify(unclosed))
+  check('未闭合引号：定位开引号（第 3 行第 18 列）',
+    unclosed.error?.kind === 'unclosed-quote' && unclosed.error.line === 3 && unclosed.error.column === 18,
+    JSON.stringify(unclosed.error))
+  check('未闭合引号：说明含物理行与列', /第 3 行第 18 列/.test(unclosed.error?.message ?? ''), unclosed.error?.message)
+  // 闭引号后杂字符："A"junk 不允许拼成 Ajunk
+  const junk = parseCsv('网段 CIDR,设备名\n192.168.10.16/30,"A"junk,192.168.10.17,aa:bb:cc:00:00:01')
+  check('闭引号后杂字符：报错（第 2 行第 21 列）且错误行记录不纳入',
+    junk.error?.kind === 'junk-after-quote' && junk.error.line === 2 && junk.error.column === 21 && junk.records.length === 1,
+    JSON.stringify(junk))
+  // 未加引号字段内的引号
+  const stray = parseCsv('网段 CIDR,设备名\n192.168.10.16/30,ab"cd,192.168.10.17,aa:bb:cc:00:00:01')
+  check('未加引号字段内的引号：报错（第 2 行第 20 列）',
+    stray.error?.kind === 'stray-quote' && stray.error.line === 2 && stray.error.column === 20,
+    JSON.stringify(stray.error))
+  // 闭引号后空格也算杂字符；闭引号后逗号 / 换行 / 文件结束合法
+  check('闭引号后空格报错', parseCsv('"a" b').error?.kind === 'junk-after-quote' && parseCsv('"a" b').error?.column === 4)
+  check('闭引号后逗号 / 换行 / 文件结束均合法',
+    parseCsv('"a",b').error === null && parseCsv('"a"\nb').error === null && parseCsv('"a"').error === null)
+  // 首个错误即停：同一文件多处错误只报首个
+  const multi = parseCsv('a,"x\nb"bad,"y')
+  check('只报首个语法错误（第 2 行闭引号后杂字符）',
+    multi.error?.kind === 'junk-after-quote' && multi.error.line === 2 && multi.error.column === 3,
+    JSON.stringify(multi.error))
+}
+
+// 22a3) 语法错误传导：禁用整批应用、保持既有登记、修正后自动恢复
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q4', name: '既有设备', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:09' },
+  ]
+  // 末条引号未闭合：即使前文有一行合法新增，也整批禁止应用
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.18,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,"未闭合,192.168.10.33,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const bad = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('末条引号未闭合：整批禁止应用（合法前文也不应用）', !bad.canApply && bad.rows.length === 0 && bad.counts.rows === 0)
+  check('末条引号未闭合：syntaxError 定位开引号（第 3 行第 18 列）',
+    bad.syntaxError?.kind === 'unclosed-quote' && bad.syntaxError.line === 3 && bad.syntaxError.column === 18,
+    JSON.stringify(bad.syntaxError))
+  check('语法错误时 merged 保持既有登记不变', bad.merged.length === 1 && bad.merged[0].id === 'keep' && bad.merged[0].address === ipToInt('192.168.10.17'))
+  check('语法错误时无表头错误、无行冲突计数', bad.headerErrors.length === 0 && !bad.hasConflicts && bad.addCount === 0 && bad.updateCount === 0)
+  // "A"junk 不得拼成 Ajunk 导入
+  const junk = buildLeaseImport(
+    ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,"A"junk,192.168.10.18,aa:bb:cc:00:00:01'].join('\n'),
+    [], hostPlan, () => 'x',
+  )
+  check('"A"junk 报语法错误而非拼成 Ajunk', junk.syntaxError?.kind === 'junk-after-quote' && !junk.canApply && junk.rows.length === 0)
+  // 未加引号字段内的引号
+  const stray = buildLeaseImport(
+    ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,ab"cd,192.168.10.18,aa:bb:cc:00:00:01'].join('\n'),
+    [], hostPlan, () => 'x',
+  )
+  check('未加引号字段内的引号：整批禁止应用', stray.syntaxError?.kind === 'stray-quote' && !stray.canApply)
+  // 修正后自动恢复：合法 CSV 的 MAC 匹配与地址互换规则不变（此处验证新增与既有 MAC 更新）
+  const fixedCsv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.18,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,"未闭合",192.168.10.33,aa:bb:cc:00:00:02',
+    '192.168.10.128/25,既有设备改名,192.168.10.200,AA-BB-CC-00-00-09',
+  ].join('\n')
+  const fixed = buildLeaseImport(fixedCsv, existing, hostPlan, (() => {
+    let n = 0
+    return () => `fix-${++n}`
+  })())
+  check('修正语法错误后恢复可应用', fixed.canApply && fixed.syntaxError === null, JSON.stringify(fixed.rows.map((r) => r.errors)))
+  check('恢复后引号字段与 MAC 匹配规则不变（2 新增 + 1 更新）',
+    fixed.counts.add === 2 && fixed.counts.update === 1 && fixed.rows[1].name === '未闭合' &&
+    fixed.merged.find((a) => a.id === 'keep')?.name === '既有设备改名' &&
+    fixed.merged.find((a) => a.id === 'keep')?.address === ipToInt('192.168.10.200'),
+    JSON.stringify(fixed.counts))
 }
 
 // 22b) 表头映射：别名、列顺序不限；缺列 / 重复列报错
@@ -2647,6 +2739,23 @@ function simulateNoTransientDup(
   })())
   const fixedCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.20/30,管理A,192.168.10.22,aa:bb:cc:00:00:01'].join('\n')
   check('改到新网段后恢复编排', buildMigrationPlan(importOrThrow(fixedCsv, existing, migratedPlan), existing, migratedPlan).steps.length === 1)
+}
+
+// 23q) CSV 语法错误：迁移清单停止生成；修正后自动恢复
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q4', name: '管理A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const badCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,"管理A,192.168.10.18,aa:bb:cc:00:00:01'].join('\n')
+  const bad = buildLeaseImport(badCsv, existing, hostPlan, () => 'x')
+  check('前置：语法错误存在且整批不可应用', bad.syntaxError !== null && !bad.canApply)
+  const mp = buildMigrationPlan(bad, existing, hostPlan)
+  check('语法错误：迁移编排停止生成（pending、零步骤）', !mp.ok && mp.steps.length === 0 && mp.blockers[0].kind === 'pending')
+  check('语法错误：迁移清单文本为空', migrationPlanText(mp) === '')
+  const goodCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,"管理A",192.168.10.18,aa:bb:cc:00:00:01'].join('\n')
+  const good = buildLeaseImport(goodCsv, existing, hostPlan, () => 'x')
+  check('修正语法错误后迁移编排自动恢复（1 步迁移）',
+    good.canApply && buildMigrationPlan(good, existing, hostPlan).steps.length === 1)
 }
 
 // ========== 24) IPv4 路径分片预演 ==========

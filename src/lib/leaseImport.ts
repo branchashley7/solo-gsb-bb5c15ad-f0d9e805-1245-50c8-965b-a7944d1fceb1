@@ -8,7 +8,10 @@
 //      故两台已有设备在 CSV 中互换地址不会因处理顺序被误报为冲突；
 //   4. 冲突类型：缺失/非法字段、输入内重复 MAC、网段内重复 IP、
 //      网络地址 / 广播地址 / 越界地址、与未更新登记的地址或 MAC 冲突；
-//   5. 任一冲突禁止应用；全部通过后由调用方一次性替换状态（原子应用）。
+//   5. CSV 语法严格校验：引号只允许出现在字段首位，闭引号后只允许逗号、换行或文件结束；
+//      未闭合引号、未加引号字段内的引号、闭引号后杂字符均为语法错误，
+//      任一语法错误即禁用整批应用、保持既有登记不变（迁移编排随之停止生成）；
+//   6. 任一冲突禁止应用；全部通过后由调用方一次性替换状态（原子应用）。
 //
 // 本模块与其他生成模块一样只读规划与既有登记，绝不修改规划、基线、路由汇总与导出。
 
@@ -25,29 +28,63 @@ export interface CsvRecord {
   cells: string[]
 }
 
+/** CSV 语法错误类别 */
+export type CsvSyntaxErrorKind =
+  | 'unclosed-quote' // 字段首位的开引号直到文件结束都没有对应闭引号
+  | 'stray-quote' // 未加引号的字段内出现引号
+  | 'junk-after-quote' // 闭引号后紧跟逗号 / 换行 / 文件结束以外的字符
+
+export interface CsvSyntaxError {
+  kind: CsvSyntaxErrorKind
+  /** 物理行号（从 1 开始） */
+  line: number
+  /** 列号（从 1 开始）；未闭合引号定位为开引号所在位置 */
+  column: number
+  /** 含行列定位的中文说明 */
+  message: string
+}
+
+export interface CsvParseResult {
+  /** 完整结束且语法合法的记录（语法错误点所在的半截记录不纳入） */
+  records: CsvRecord[]
+  /** 首个语法错误（无错误为 null） */
+  error: CsvSyntaxError | null
+}
+
 /**
- * 解析 CSV 文本为记录列表（不做表头映射）。
+ * 解析 CSV 文本为记录列表（不做表头映射），字段状态机严格校验引号用法。
  * 支持：引号包裹的字段、字段内逗号/换行、双引号转义（""）；
- * 跳过完全空白的物理行；CRLF / CR / LF 均识别。
+ * 跳过完全空白的物理行；BOM 自动去除；CRLF 算一次换行，单独 CR / LF 各算一次，
+ * 引号内一律保留原始换行字符。
+ * 语法规则：引号只允许出现在字段首位；闭引号后只允许逗号、换行或文件结束。
+ * 首个语法错误即停止解析并返回错误（含物理行、列定位）。
  */
-export function parseCsv(input: string): CsvRecord[] {
+export function parseCsv(input: string): CsvParseResult {
   const text = input.replace(/^﻿/, '')
   const records: CsvRecord[] = []
   let cells: string[] = []
   let field = ''
-  let inQuotes = false
+  // 字段状态机：
+  //   start    —— 字段尚未开始：引号只允许出现在这个位置
+  //   unquoted —— 未加引号字段进行中：其中出现引号即语法错误
+  //   quoted   —— 引号字段进行中："" 转义为一个引号，逗号 / 换行都是字段内容
+  //   closed   —— 闭引号之后：只允许逗号、换行或文件结束
+  let state: 'start' | 'unquoted' | 'quoted' | 'closed' = 'start'
   let recordStart = 1
   let line = 1
-  let fieldStarted = false
-  let hasContent = false // 当前记录是否出现过任何非空白内容
+  let column = 1
+  let hasContent = false // 当前记录是否出现过任何非空白内容（引号字段本身也算内容）
+  // 当前引号字段的开引号位置（未闭合引号错误定位用）
+  let quoteLine = 1
+  let quoteColumn = 1
+  let error: CsvSyntaxError | null = null
 
   function pushField() {
     cells.push(field)
     field = ''
-    fieldStarted = false
+    state = 'start'
   }
   function endRecord() {
-    if (inQuotes) return
     pushField()
     if (hasContent) records.push({ line: recordStart, cells })
     cells = []
@@ -57,46 +94,94 @@ export function parseCsv(input: string): CsvRecord[] {
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
+    // 换行：CRLF 算一次；单独 CR / LF 各算一次，引号内保留原始换行字符
     if (ch === '\n' || ch === '\r') {
-      if (ch === '\r' && text[i + 1] === '\n') i++
-      if (inQuotes) {
-        field += ch === '\r' ? '\r\n' : ch
+      let newline = ch
+      if (ch === '\r' && text[i + 1] === '\n') {
+        newline = '\r\n'
+        i++
+      }
+      if (state === 'quoted') {
+        field += newline
       } else {
         endRecord()
       }
       line++
+      column = 1
       continue
     }
-    if (inQuotes) {
+    if (state === 'quoted') {
       if (ch === '"') {
         if (text[i + 1] === '"') {
           field += '"'
           i++
+          column += 2
         } else {
-          inQuotes = false
+          state = 'closed'
+          column++
         }
       } else {
         field += ch
+        column++
       }
       continue
     }
-    if (ch === '"' && !fieldStarted) {
-      inQuotes = true
-      fieldStarted = true
-      hasContent = true
-      continue
+    if (state === 'closed') {
+      if (ch === ',') {
+        pushField()
+        column++
+        continue
+      }
+      error = {
+        kind: 'junk-after-quote',
+        line,
+        column,
+        message: `第 ${line} 行第 ${column} 列：闭引号后只允许逗号、换行或文件结束，不允许出现其他字符（“${ch}”）`,
+      }
+      break
+    }
+    if (ch === '"') {
+      if (state === 'start') {
+        state = 'quoted'
+        quoteLine = line
+        quoteColumn = column
+        hasContent = true
+        column++
+        continue
+      }
+      error = {
+        kind: 'stray-quote',
+        line,
+        column,
+        message: `第 ${line} 行第 ${column} 列：未加引号的字段内不允许出现引号（"）；引号只允许出现在字段首位`,
+      }
+      break
     }
     if (ch === ',') {
       pushField()
+      column++
       continue
     }
     field += ch
-    fieldStarted = true
+    state = 'unquoted'
     if (!/\s/.test(ch)) hasContent = true
+    column++
   }
-  // 末尾记录（文件无尾换行时）
-  if (cells.length > 0 || field.length > 0 || fieldStarted) endRecord()
-  return records
+
+  // 文件结束仍在引号内：未闭合引号，定位到开引号
+  if (!error && state === 'quoted') {
+    error = {
+      kind: 'unclosed-quote',
+      line: quoteLine,
+      column: quoteColumn,
+      message: `第 ${quoteLine} 行第 ${quoteColumn} 列：字段开引号（"）未闭合——到文件结束都没有对应的闭引号`,
+    }
+  }
+  // 末尾记录（文件无尾换行时）；语法错误点所在的半截记录一律丢弃
+  if (!error && (cells.length > 0 || field.length > 0 || state === 'closed')) {
+    endRecord()
+  }
+  return { records, error }
 }
 
 /* ---------- 表头映射 ---------- */
@@ -205,6 +290,8 @@ export interface LeaseImportCounts {
 }
 
 export interface LeaseImportResult {
+  /** 首个 CSV 语法错误（无错误为 null）；存在时 rows 为空、禁止应用、merged 保持既有登记 */
+  syntaxError: CsvSyntaxError | null
   headerMap: HeaderMap | null
   headerError: HeaderError | null
   /** 表头级错误的中文说明（无错误为空数组） */
@@ -213,7 +300,7 @@ export interface LeaseImportResult {
   counts: LeaseImportCounts
   /** 是否存在任何阻止应用的问题（表头错误或至少一行冲突） */
   hasConflicts: boolean
-  /** 是否可应用：无冲突且至少有一条数据行 */
+  /** 是否可应用：无语法错误、无冲突且至少有一条数据行 */
   canApply: boolean
   /** 应用后的完整登记快照（canApply 为 true 时可信） */
   merged: HostAssignment[]
@@ -289,10 +376,10 @@ export function buildLeaseImport(
   result: PlanResult,
   genId: () => string = defaultLeaseIdGen,
 ): LeaseImportResult {
-  const records = parseCsv(csv)
-  const { map: headerMap, error: headerError } = mapHeader(records[0])
+  const { records, error: syntaxError } = parseCsv(csv)
 
   const empty: LeaseImportResult = {
+    syntaxError: null,
     headerMap: null,
     headerError: null,
     headerErrors: [],
@@ -305,6 +392,13 @@ export function buildLeaseImport(
     updateCount: 0,
   }
 
+  // 任一语法错误：禁用整批应用、保持既有登记不变（canApply=false 使迁移编排同步停止生成）；
+  // 原始 CSV 由调用方保留，修正后重新执行本函数即自动恢复
+  if (syntaxError) {
+    return { ...empty, syntaxError }
+  }
+
+  const { map: headerMap, error: headerError } = mapHeader(records[0])
   if (headerError) {
     return { ...empty, headerError, headerErrors: [headerErrorText(headerError)] }
   }
@@ -570,6 +664,7 @@ export function buildLeaseImport(
   const hasConflicts = counts.conflict > 0
 
   return {
+    syntaxError: null,
     headerMap: map,
     headerError: null,
     headerErrors: [],

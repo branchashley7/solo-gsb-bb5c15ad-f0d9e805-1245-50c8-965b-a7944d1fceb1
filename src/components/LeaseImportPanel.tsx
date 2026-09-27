@@ -126,6 +126,19 @@ export default function LeaseImportPanel({
         }}
       />
 
+      {built && built.syntaxError && (
+        <div className="opt121-error-box">
+          <strong>CSV 语法错误（首个）：</strong>
+          <ul>
+            <li>{built.syntaxError.message}</li>
+          </ul>
+          <div className="migration-block-hint">
+            引号只允许出现在字段首位，闭引号后只允许逗号、换行或文件结束。存在语法错误时
+            <strong>整批应用已禁用、既有登记保持不变</strong>，迁移编排同步停止生成；原始 CSV 已保留，修正后预览自动恢复。
+          </div>
+        </div>
+      )}
+
       {built && built.headerErrors.length > 0 && (
         <div className="opt121-error-box">
           <strong>无法识别 CSV 表头：</strong>
@@ -229,13 +242,14 @@ export default function LeaseImportPanel({
         </>
       )}
 
-      {built && built.headerErrors.length === 0 && built.rows.length === 0 && hasCsv && (
+      {built && !built.syntaxError && built.headerErrors.length === 0 && built.rows.length === 0 && hasCsv && (
         <div className="dnsmasq-empty">CSV 只有表头、没有数据行；粘贴数据后这里将实时显示逐行预览。</div>
       )}
 
       {!hasCsv && !invalid && (
         <p className="summary-empty">
-          尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号），
+          尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号与换行，
+          <code className="mono">""</code> 表示一个双引号），引号只允许出现在字段首位、闭引号后只允许逗号或换行，
           空行会被忽略。导入只更新主机登记，不影响规划、基线、路由汇总与 JSON 导出。
         </p>
       )}

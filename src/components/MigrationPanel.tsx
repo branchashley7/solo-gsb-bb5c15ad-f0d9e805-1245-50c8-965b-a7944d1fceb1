@@ -105,6 +105,7 @@ export default function MigrationPanel({ result, assignments, imported }: Props)
   }
 
   const hasCsvData = !!imported && imported.rows.length > 0 && imported.headerErrors.length === 0
+  const syntaxError = imported?.syntaxError ?? null
 
   return (
     <div className="panel migration-panel">
@@ -126,6 +127,13 @@ export default function MigrationPanel({ result, assignments, imported }: Props)
       {!invalid && imported && imported.headerErrors.length > 0 && (
         <div className="summary-disabled-note">
           CSV 表头无法识别（见上方 ⑩ 面板），迁移编排暂不产生结果；修正表头后自动重算。
+        </div>
+      )}
+
+      {!invalid && syntaxError && (
+        <div className="summary-disabled-note">
+          CSV 存在语法错误（第 {syntaxError.line} 行第 {syntaxError.column} 列，详见上方 ⑩ 面板），
+          迁移编排已停止生成、登记保持不变；修正 CSV 后自动重算。
         </div>
       )}
 
@@ -231,7 +239,7 @@ export default function MigrationPanel({ result, assignments, imported }: Props)
         </>
       )}
 
-      {!invalid && !hasCsvData && (
+      {!invalid && !hasCsvData && !syntaxError && (
         <p className="summary-empty">
           尚未粘贴有效的 CSV 数据。请在上方 ⑩ 静态租约批量导入中粘贴含表头的 CSV；预览无冲突后，
           这里会自动给出从现有登记到合并结果的逐步改址清单（含设备、原 / 目标 / 临时地址与每步原因）。
