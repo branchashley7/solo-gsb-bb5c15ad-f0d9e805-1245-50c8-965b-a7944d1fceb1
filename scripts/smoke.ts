@@ -2033,12 +2033,91 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
 
 // 22a) CSV 解析：引号、转义双引号、字段内逗号/换行、CRLF、BOM、空行
 {
-  const recs = parseCsv('﻿网段 CIDR,设备名\r\n192.168.10.16/30,"设备,A"\r\n\r\n"x""y",z\n')
+  const parsed = parseCsv('﻿网段 CIDR,设备名\r\n192.168.10.16/30,"设备,A"\r\n\r\n"x""y",z\n')
+  check('合法 CSV 无语法错误', parsed.error === null)
+  const recs = parsed.records
   check('CSV 解析：BOM 去除、CRLF、跳过空行（3 条记录）', recs.length === 3, JSON.stringify(recs))
   check('CSV 表头两列', recs[0].cells.length === 2 && recs[0].cells[0] === '网段 CIDR')
   check('CSV 引号内逗号不切分', recs[1].cells[1] === '设备,A')
   check('CSV 双引号转义', recs[2].cells[0] === 'x"y' && recs[2].line === 4, JSON.stringify(recs[2]))
-  check('空文本解析为空记录', parseCsv('  \n \n').length === 0)
+  check('空文本解析为空记录', parseCsv('  \n \n').records.length === 0)
+}
+
+// 22a2) CSV 引号内换行：CRLF 算一次换行；单独 CR / LF 原样保留换行内容
+{
+  const r = parseCsv('a,"x\r\ny"\nb,"p\rq"\nc,"m\nn"')
+  check('引号内 CRLF / 单独 CR / 单独 LF 均合法', r.error === null && r.records.length === 3, JSON.stringify(r))
+  check('引号内 CRLF 保留为 \\r\\n', r.records[0].cells[1] === 'x\r\ny', JSON.stringify(r.records[0]))
+  check('引号内单独 CR 保留为 \\r（不改写为 CRLF）', r.records[1].cells[1] === 'p\rq', JSON.stringify(r.records[1]))
+  check('引号内单独 LF 保留为 \\n', r.records[2].cells[1] === 'm\nn', JSON.stringify(r.records[2]))
+  // 引号内 CRLF 只算一次换行：三条记录分别起于物理行 1 / 3 / 5
+  check(
+    '引号内 CRLF 算一次换行（记录物理行号正确）',
+    r.records[0].line === 1 && r.records[1].line === 3 && r.records[2].line === 5,
+    r.records.map((x) => x.line).join(','),
+  )
+}
+
+// 22a3) CSV 语法错误：末条引号未闭合 -> 报错定位开引号，且整批拒绝（不得只丢末条而应用前文）
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q3', name: '留守', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:09' },
+  ]
+  const text = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,"管理B,192.168.10.18,aa:bb:cc:00:00:02', // 末条引号未闭合
+  ].join('\n')
+  const r = parseCsv(text)
+  check('末条引号未闭合报语法错误', r.error?.kind === 'unclosed-quote', JSON.stringify(r.error))
+  check('未闭合定位到开引号（第 3 行第 18 列）', r.error?.line === 3 && r.error?.column === 18, JSON.stringify(r.error))
+  const built = buildLeaseImport(text, existing, hostPlan, () => 'x')
+  check(
+    '语法错误整批拒绝：不可应用、无逐行数据',
+    !built.canApply && built.hasConflicts && built.rows.length === 0 && built.syntaxErrors.length === 1,
+  )
+  check('语法错误说明含物理行与列', /第 3 行第 18 列/.test(built.syntaxErrors[0] ?? ''), built.syntaxErrors[0])
+  check('语法错误时既有登记原样保留（merged 不变）', built.merged.length === 1 && built.merged[0].id === 'keep')
+  const mp = buildMigrationPlan(built, existing, hostPlan)
+  check('语法错误时迁移清单停止生成（pending、零步骤）', !mp.ok && mp.steps.length === 0 && mp.blockers[0]?.kind === 'pending')
+  // 修正（补上闭引号）后自动恢复
+  const fixedText = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,"管理B",192.168.10.18,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const fixed = buildLeaseImport(fixedText, existing, hostPlan, () => 'x')
+  check('补上闭引号后自动恢复可应用', fixed.canApply && fixed.counts.add === 2, JSON.stringify(fixed.rows.map((x) => x.errors)))
+}
+
+// 22a4) CSV 语法错误：闭引号后杂字符（"A"junk 不得拼成 Ajunk 导入）
+{
+  const text = '网段 CIDR,设备名,IPv4,MAC\n192.168.10.16/30,"A"junk,192.168.10.17,aa:bb:cc:00:00:01'
+  const r = parseCsv(text)
+  check('闭引号后杂字符报语法错误', r.error?.kind === 'junk-after-quote', JSON.stringify(r.error))
+  check('杂字符定位（第 2 行第 21 列）', r.error?.line === 2 && r.error?.column === 21, JSON.stringify(r.error))
+  const built = buildLeaseImport(text, [], hostPlan, () => 'x')
+  check(
+    '"A"junk 不再拼成 Ajunk 导入（整批拒绝）',
+    !built.canApply && built.rows.length === 0 && built.syntaxError?.kind === 'junk-after-quote',
+  )
+  check('闭引号后空格同样报错', parseCsv('a,"x" \nb').error?.kind === 'junk-after-quote')
+  check('闭引号后逗号、换行、文件结束均合法', parseCsv('"a","b"\n"c","d"\n"e","f"').error === null)
+}
+
+// 22a5) CSV 语法错误：未加引号字段内的引号（引号只允许出现在字段首位）
+{
+  const r = parseCsv('网段 CIDR,设备名\n192.168.10.16/30,Ab"c')
+  check('未加引号字段内的引号报语法错误', r.error?.kind === 'quote-in-unquoted-field', JSON.stringify(r.error))
+  check('裸引号定位（第 2 行第 20 列）', r.error?.line === 2 && r.error?.column === 20, JSON.stringify(r.error))
+  check('字段首位空白后的引号同样拒绝', parseCsv('a, "b"').error?.kind === 'quote-in-unquoted-field')
+  const built = buildLeaseImport(
+    '网段 CIDR,设备名,IPv4,MAC\n192.168.10.16/30,Ab"c,192.168.10.17,aa:bb:cc:00:00:01',
+    [],
+    hostPlan,
+    () => 'x',
+  )
+  check('裸引号整批拒绝且迁移清单停止生成', !built.canApply && buildMigrationPlan(built, [], hostPlan).steps.length === 0)
 }
 
 // 22b) 表头映射：别名、列顺序不限；缺列 / 重复列报错

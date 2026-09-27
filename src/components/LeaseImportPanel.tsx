@@ -92,7 +92,9 @@ export default function LeaseImportPanel({
         <span className="lease-status update"> 更新 </span>
         <span className="lease-status unchanged"> 无变化 </span>
         <span className="lease-status conflict"> 冲突 </span>
-        。<strong>任一冲突即禁止应用</strong>，全部通过后一次性替换登记状态。规划变化后原始 CSV 保留、预览自动重算。
+        。<strong>任一冲突即禁止应用</strong>，全部通过后一次性替换登记状态。引号语法严格校验
+        （引号仅在字段首位、闭引号后仅允许逗号 / 换行），<strong>首个语法错误按物理行、列定位并整批拒绝</strong>。
+        规划变化后原始 CSV 保留、预览自动重算。
       </p>
 
       {invalid && (
@@ -125,6 +127,22 @@ export default function LeaseImportPanel({
           setAppliedNote(null)
         }}
       />
+
+      {built && built.syntaxError && (
+        <div className="opt121-error-box">
+          <strong>
+            CSV 语法错误（第 {built.syntaxError.line} 行第 {built.syntaxError.column} 列）：
+          </strong>
+          <ul>
+            {built.syntaxErrors.map((m, i) => (
+              <li key={i}>{m}</li>
+            ))}
+          </ul>
+          <div className="migration-block-hint">
+            存在语法错误时整批不可应用、既有登记保持不变、迁移编排停止生成；修正后预览自动恢复，原始 CSV 不会丢失。
+          </div>
+        </div>
+      )}
 
       {built && built.headerErrors.length > 0 && (
         <div className="opt121-error-box">
@@ -229,14 +247,15 @@ export default function LeaseImportPanel({
         </>
       )}
 
-      {built && built.headerErrors.length === 0 && built.rows.length === 0 && hasCsv && (
+      {built && !built.syntaxError && built.headerErrors.length === 0 && built.rows.length === 0 && hasCsv && (
         <div className="dnsmasq-empty">CSV 只有表头、没有数据行；粘贴数据后这里将实时显示逐行预览。</div>
       )}
 
       {!hasCsv && !invalid && (
         <p className="summary-empty">
-          尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号），
-          空行会被忽略。导入只更新主机登记，不影响规划、基线、路由汇总与 JSON 导出。
+          尚未粘贴 CSV。可点击「填入示例 CSV」参考格式；支持引号包裹的字段（字段内可含逗号与换行），
+          引号必须出现在字段首位、闭引号后只允许逗号或换行，空行会被忽略。
+          导入只更新主机登记，不影响规划、基线、路由汇总与 JSON 导出。
         </p>
       )}
 

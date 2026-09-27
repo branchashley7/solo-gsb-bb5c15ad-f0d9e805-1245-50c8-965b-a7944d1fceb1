@@ -104,7 +104,8 @@ export default function MigrationPanel({ result, assignments, imported }: Props)
     }
   }
 
-  const hasCsvData = !!imported && imported.rows.length > 0 && imported.headerErrors.length === 0
+  const hasCsvData =
+    !!imported && !imported.syntaxError && imported.rows.length > 0 && imported.headerErrors.length === 0
 
   return (
     <div className="panel migration-panel">
@@ -120,6 +121,13 @@ export default function MigrationPanel({ result, assignments, imported }: Props)
       {invalid && (
         <div className="summary-disabled-note">
           输入非法（请先修正左侧错误），迁移执行编排已暂停；原始 CSV 与登记均已保留，修正后自动重算。
+        </div>
+      )}
+
+      {!invalid && imported && imported.syntaxError && (
+        <div className="summary-disabled-note">
+          CSV 存在语法错误（第 {imported.syntaxError.line} 行第 {imported.syntaxError.column} 列，见上方 ⑩ 面板），
+          迁移编排暂不产生结果、登记保持不变；修正后自动重算。
         </div>
       )}
 
